@@ -279,6 +279,7 @@ def test_CER_1769_catalog_details_page_check_pairs_prices():
 
     # ================= SLACK RESULT =================
     if failed_pairs:   # 🔴 THIS CONDITION SENDS ERROR TO SLACK
+        print(failed_pairs)
         message = (
             f"*Status:* FAILED\n"
             f"*Failed Pairs:* {len(failed_pairs)}\n"
