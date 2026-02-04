@@ -1,22 +1,24 @@
-
-
 import requests
 from datetime import datetime
 import pytz
-import os
 import concurrent.futures
+import traceback
 
+TELEGRAM_BOT_TOKEN = "8202787356:AAHf5MKKGJhjkOslwShiFlC8YiIMJLtwb2o"
+TELEGRAM_CHAT_ID = "6445351835"
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL") 
-
-
-
-def send_slack_message(message, success=True):
-    emoji = ":white_check_mark:" if success else ":x:"
+# 8202787356:AAHf5MKKGJhjkOslwShiFlC8YiIMJLtwb2o
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "text": f"{emoji} *Catalog Price Feed Check*\n{message}"
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
     }
-    requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=30)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
 
 def get_current_datetime_ist():
@@ -24,13 +26,12 @@ def get_current_datetime_ist():
 
 
 def convert_date_time_with_timezone(date_time):
-    datetime_object = datetime.fromisoformat(date_time.replace("Z", "+00:00"))
+    datetime_object = datetime.fromisoformat(date_time.replace('Z', '+00:00'))
     return datetime_object.astimezone(pytz.timezone("Asia/Kolkata"))
 
 
 def post_api_data_from_supra_data_dashboard(payload):
     url = "https://prod-bff-dashboard.supra.com/graphql"
-    # url = "https://qa-api.cerberus.supra.com/graphql"
     headers = {"Content-Type": "application/json"}
     return requests.post(url, json=payload, headers=headers, timeout=300)
 
@@ -66,7 +67,8 @@ def get_catalog_page_pairs_all_pairs_name():
     if response.status_code == 200:
         return response.json()["data"]["catalog"]["relatedFilters"]["instruments"]
 
-    return []
+    send_telegram_message("❌ Failed to fetch catalog instruments API")
+    return None
 
 
 def get_catalog_trading_pair_prices(pair_name):
@@ -94,6 +96,7 @@ def get_catalog_trading_pair_prices(pair_name):
         data = response.json()["data"]["catalogTradingPairPrices"]
         return data[0]["timestamp"] if data else None
 
+    send_telegram_message(f"⚠️ API failed for trading pair: {pair_name}")
     return None
 
 
@@ -101,70 +104,59 @@ def fetch_price(pair):
     return pair, get_catalog_trading_pair_prices(pair)
 
 
-# ================= MAIN TEST =================
 def test_CER_1769_catalog_details_page_check_pairs_prices():
+    try:
+        failed_pairs = []
 
-    failed_pairs = []
+        instruments = get_catalog_page_pairs_all_pairs_name()
+        if not instruments:
+            raise Exception("No instruments found")
 
-    instruments = get_catalog_page_pairs_all_pairs_name()
-    if not instruments:
-        send_slack_message(
-            "*Status:* FAILED\nCatalog instruments API failed",
-            success=False
+        pair_type_map = {
+            item["tradingPair"]: item["instrumentTypeId"]
+            for item in instruments
+        }
+
+        trading_pairs = list(pair_type_map.keys())
+        current_datetime = get_current_datetime_ist()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(fetch_price, pair) for pair in trading_pairs]
+
+            for future in concurrent.futures.as_completed(futures):
+                trading_pair, timestamp = future.result()
+
+                if not timestamp:
+                    failed_pairs.append(trading_pair)
+                    continue
+
+                node_datetime = convert_date_time_with_timezone(timestamp)
+                instrument_type_id = pair_type_map.get(trading_pair)
+                allowed_minutes = 360 if instrument_type_id == "7" else 10
+
+                delta_minutes = abs(
+                    (current_datetime - node_datetime).total_seconds()
+                ) / 60
+
+                if delta_minutes > allowed_minutes:
+                    failed_pairs.append(trading_pair)
+
+        if failed_pairs:
+            message = (
+                "🚨 <b>Price Feed Delay Alert</b>\n\n"
+                f"<b>Failed Pairs:</b>\n{', '.join(set(failed_pairs))}"
+            )
+            send_telegram_message(message)
+        else:
+            send_telegram_message("✅ All trading pairs are updating correctly")
+
+    except Exception as e:
+        error_message = (
+            "🔥 <b>Script Execution Failed</b>\n\n"
+            f"<pre>{traceback.format_exc()}</pre>"
         )
-        return
-
-    pair_type_map = {
-        item["tradingPair"]: item["instrumentTypeId"]
-        for item in instruments
-    }
-
-    trading_pairs = list(pair_type_map.keys())
-    current_datetime = get_current_datetime_ist()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(fetch_price, pair) for pair in trading_pairs]
-
-        for future in concurrent.futures.as_completed(futures):
-            trading_pair, timestamp = future.result()
-
-            # ❌ ERROR CONDITION 1: No timestamp
-            if not timestamp:
-                failed_pairs.append(f"{trading_pair} (no timestamp)")
-                continue
-
-            node_datetime = convert_date_time_with_timezone(timestamp)
-            instrument_type_id = pair_type_map.get(trading_pair)
-            allowed_minutes = 360 if instrument_type_id == "7" else 10
-
-            delta_minutes = abs(
-                (current_datetime - node_datetime).total_seconds()
-            ) / 60
-
-            # ❌ ERROR CONDITION 2: Price too old
-            if delta_minutes > allowed_minutes:
-                failed_pairs.append(
-                    f"{trading_pair} ({int(delta_minutes)} mins old)"
-                )
-
-    # ================= SLACK RESULT =================
-    if failed_pairs:   # 🔴 THIS CONDITION SENDS ERROR TO SLACK
-        print(failed_pairs)
-        message = (
-            f"*Status:* FAILED\n"
-            f"*Failed Pairs:* {len(failed_pairs)}\n"
-            f"*Details:*\n```" + "\n".join(failed_pairs) + "```"
-        )
-        send_slack_message(message, success=False)
-    else:
-        message = (
-            "*Status:* PASSED\n"
-            f"*Checked Pairs:* {len(trading_pairs)}\n"
-            "All price feeds are updating correctly."
-        )
-        send_slack_message(message, success=True)
+        send_telegram_message(error_message)
 
 
-# ================= RUN =================
 if __name__ == "__main__":
     test_CER_1769_catalog_details_page_check_pairs_prices()
